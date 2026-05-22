@@ -86,12 +86,25 @@ impl StreamHub {
         ch.next_subscriber += 1;
         let ssrc = 0x4e394d00u32 | channel as u32;
         let timestamp = ch.timestamp;
-        if let Some(sps) = ch.sps.clone() {
-            let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, false, &sps);
+        let sps = ch.sps.clone();
+        let pps = ch.pps.clone();
+        if let (Some(sps), Some(pps)) = (&sps, &pps) {
+            let nals = [sps.as_slice(), pps.as_slice()];
+            if can_stap_a(&nals) {
+                let payload = build_stap_a(&nals);
+                let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, true, &payload);
+                let _ = tx.send(packet);
+            } else {
+                let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, false, sps);
+                let _ = tx.send(packet);
+                let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, true, pps);
+                let _ = tx.send(packet);
+            }
+        } else if let Some(sps) = sps {
+            let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, true, &sps);
             let _ = tx.send(packet);
-        }
-        if let Some(pps) = ch.pps.clone() {
-            let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, false, &pps);
+        } else if let Some(pps) = pps {
+            let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, true, &pps);
             let _ = tx.send(packet);
         }
         ch.subscribers.insert(id, tx);
@@ -287,6 +300,7 @@ fn collect_rtp_nals<'a>(nals: &'a [&'a [u8]], ch: &mut ChannelHub) -> Vec<&'a [u
                 out.push(*nal);
             }
             Some(1) | Some(5) => out.push(*nal),
+            Some(6) => out.push(*nal),
             _ => {}
         }
     }
@@ -464,8 +478,7 @@ fn write_interleaved(stream: &mut TcpStream, channel: u8, payload: &[u8]) -> std
     let len = payload.len() as u16;
     stream.write_all(&[b'$', channel])?;
     stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()
+    stream.write_all(payload)
 }
 
 fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {

@@ -205,7 +205,7 @@ pub fn run_bridge(
 
     for (idx, enabled) in cfg.channels.iter().enumerate() {
         if *enabled {
-            request_channel(&mut control, &cfg.stream_name, &session, idx + 1)?;
+            start_live_channel(&mut control, &cfg.stream_name, &session, idx + 1, &stop)?;
         }
     }
     control
@@ -278,10 +278,16 @@ pub fn run_bridge(
     Ok(())
 }
 
-fn request_channel(stream: &mut TcpStream, stream_name: &str, session: &str, channel: usize) -> Result<(), String> {
+fn start_live_channel(
+    stream: &mut TcpStream,
+    stream_name: &str,
+    session: &str,
+    channel: usize,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), String> {
     let channel_mask = 1usize << (channel - 1);
-    let params = format!(
-        "{{\"AUDIOVALID\":{},\"CHANNEL\":{},\"FRAMEMODE\":0,\"STREAMNAME\":\"{}\",\"STREAMTYPE\":2}}",
+    let request_params = format!(
+        "{{\"AUDIOVALID\":{},\"CHANNEL\":{},\"STREAMNAME\":\"{}\",\"STREAMTYPE\":2}}",
         channel_mask,
         channel_mask,
         json_escape(stream_name)
@@ -291,11 +297,53 @@ fn request_channel(stream: &mut TcpStream, stream_name: &str, session: &str, cha
         &json_packet(
             "MEDIASTREAMMODEL",
             "REQUESTALIVEVIDEO",
-            Some(&params),
+            Some(&request_params),
             None,
             session,
         ),
-    )
+    )?;
+
+    let response = read_json_response(stream, stop)?;
+    if json_get_u64(&response, "ERRORCODE").unwrap_or(0) != 0 {
+        return Err(format!("REQUESTALIVEVIDEO failed for channel {channel}: {response}"));
+    }
+    let ssrc = json_get_u64(&response, "SSRC").ok_or_else(|| {
+        format!("REQUESTALIVEVIDEO response missing SSRC for channel {channel}: {response}")
+    })?;
+
+    let task_params = format!(
+        "{{\"IPANDPORT\":\":0\",\"PT\":2,\"SSRC\":{},\"STREAMNAME\":\"{}\"}}",
+        ssrc,
+        json_escape(stream_name)
+    );
+    send_json(
+        stream,
+        &json_packet(
+            "MEDIASTREAMMODEL",
+            "MEDIATASKSTART",
+            Some(&task_params),
+            None,
+            session,
+        ),
+    )?;
+
+    let control_params = format!(
+        "{{\"CMD\":1,\"PT\":2,\"SSRC\":{},\"STREAMNAME\":\"{}\",\"STREAMTYPE\":0}}",
+        ssrc,
+        json_escape(stream_name)
+    );
+    send_json(
+        stream,
+        &json_packet(
+            "MEDIASTREAMMODEL",
+            "CONTROLSTREAM",
+            Some(&control_params),
+            None,
+            session,
+        ),
+    )?;
+
+    Ok(())
 }
 
 fn drain_control(stream: &mut TcpStream, reader: &mut PacketReader, session: &str) {
