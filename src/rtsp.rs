@@ -80,8 +80,10 @@ impl StreamHub {
         ch.timestamp = ch.timestamp.wrapping_add(RTP_TIMESTAMP_STEP);
         let timestamp = ch.timestamp;
         let ssrc = 0x4e394d00u32 | channel as u32;
+        let au_nals = build_access_unit_nals(ch, &rtp_nals);
+        let au_refs: Vec<&[u8]> = au_nals.iter().map(Vec::as_slice).collect();
         let mut packets = Vec::new();
-        packetize_access_unit(&rtp_nals, timestamp, ssrc, ch, &mut packets);
+        packetize_access_unit(&au_refs, timestamp, ssrc, ch, &mut packets);
         ch.subscribers
             .retain(|_, tx| tx.send(packets.clone()).is_ok());
     }
@@ -130,7 +132,11 @@ impl StreamHub {
             } else {
                 "42e01f".to_string()
             };
-            format!("a=fmtp:96 packetization-mode=1;profile-level-id={profile}\r\n")
+            // SPS only in SDP (stable). PPS changes every frame and must stay in-band.
+            format!(
+                "a=fmtp:96 packetization-mode=1;profile-level-id={profile};sprop-parameter-sets={}\r\n",
+                base64(sps)
+            )
         } else {
             "a=fmtp:96 packetization-mode=1\r\n".to_string()
         };
@@ -277,6 +283,23 @@ fn handle_client(mut stream: TcpStream, hub: StreamHub, _state: AppState) {
     if let Some((ch, sub_id)) = subscribed {
         hub.unsubscribe(ch, sub_id);
     }
+}
+
+/// MDVR P-frames are usually `PPS + slice` without SPS. Decoders still need the
+/// active SPS from the last IDR, so prepend cached SPS before PPS on P-frames.
+fn build_access_unit_nals(ch: &ChannelHub, rtp_nals: &[&[u8]]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let has_sps = rtp_nals.iter().any(|nal| matches!(nal_type(nal), Some(7)));
+    let has_pframe = rtp_nals.iter().any(|nal| matches!(nal_type(nal), Some(1)));
+    if has_pframe && !has_sps {
+        if let Some(sps) = &ch.sps {
+            out.push(sps.clone());
+        }
+    }
+    for nal in rtp_nals {
+        out.push(nal.to_vec());
+    }
+    out
 }
 
 fn collect_rtp_nals<'a>(nals: &'a [&'a [u8]], ch: &mut ChannelHub) -> Vec<&'a [u8]> {
@@ -575,4 +598,45 @@ mod tests {
         let pps_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
         assert_eq!(&payload[3..3 + pps_len], pps);
     }
+
+    #[test]
+    fn build_access_unit_prepends_sps_before_pps_slice() {
+        let mut ch = ChannelHub::new();
+        let sps = vec![0x67, 0x42, 0xe0, 0x1f];
+        let pps = vec![0x68, 0x01];
+        let slice = vec![0x41, 0x02];
+        ch.sps = Some(sps.clone());
+        let nals = [&pps[..], &slice[..]];
+        let rtp_nals = collect_rtp_nals(&nals, &mut ch);
+        let au = build_access_unit_nals(&ch, &rtp_nals);
+        assert_eq!(au.len(), 3);
+        assert_eq!(au[0], sps);
+        assert_eq!(au[1], pps);
+        assert_eq!(au[2], slice);
+    }
+}
+
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i];
+        let b1 = *data.get(i + 1).unwrap_or(&0);
+        let b2 = *data.get(i + 2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < data.len() {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < data.len() {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
 }
