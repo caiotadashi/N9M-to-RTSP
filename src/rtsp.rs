@@ -9,11 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::AppState;
 
 const RTP_MTU: usize = 1200;
-/// Default 90 kHz step when the first frame arrives (~15 fps).
-const RTP_TIMESTAMP_STEP: u32 = 6000;
-/// Clamp wall-clock deltas (10 fps – 2 s) in 90 kHz units.
-const RTP_TIMESTAMP_MIN: u32 = 9000;
-const RTP_TIMESTAMP_MAX: u32 = 180_000;
+/// H.264 RTP clock (RFC 6184).
+const RTP_CLOCK_HZ: f64 = 90_000.0;
 
 type AccessUnitPackets = Vec<Vec<u8>>;
 
@@ -36,8 +33,10 @@ struct ChannelHub {
     subscribers: HashMap<u64, RtspSubscriber>,
     next_subscriber: u64,
     sequence: u16,
+    /// Last RTP timestamp sent (monotonic).
     timestamp: u32,
-    last_au_at: Option<Instant>,
+    /// Wall-clock anchor for variable frame rate (90 kHz).
+    stream_epoch: Option<Instant>,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
 }
@@ -78,17 +77,7 @@ impl StreamHub {
             return;
         }
 
-        let now = Instant::now();
-        let step = ch
-            .last_au_at
-            .map(|prev| {
-                let ms = now.duration_since(prev).as_millis() as u32;
-                (ms.saturating_mul(90)).clamp(RTP_TIMESTAMP_MIN, RTP_TIMESTAMP_MAX)
-            })
-            .unwrap_or(RTP_TIMESTAMP_STEP);
-        ch.last_au_at = Some(now);
-        ch.timestamp = ch.timestamp.wrapping_add(step);
-        let timestamp = ch.timestamp;
+        let timestamp = next_rtp_timestamp(ch, Instant::now());
         let ssrc = 0x4e394d00u32 | channel as u32;
         let au_nals = build_access_unit_nals(ch, &rtp_nals);
         let au_refs: Vec<&[u8]> = au_nals.iter().map(Vec::as_slice).collect();
@@ -182,7 +171,7 @@ impl ChannelHub {
             next_subscriber: 1,
             sequence: 1,
             timestamp: 0,
-            last_au_at: None,
+            stream_epoch: None,
             sps: None,
             pps: None,
         }
@@ -365,33 +354,23 @@ fn collect_rtp_nals<'a>(nals: &'a [&'a [u8]], ch: &mut ChannelHub) -> Vec<&'a [u
     out
 }
 
-fn stap_a_payload_size(nals: &[&[u8]]) -> usize {
-    1 + nals.iter().map(|nal| 2 + nal.len()).sum::<usize>()
-}
-
-fn can_stap_a(nals: &[&[u8]]) -> bool {
-    !nals.is_empty()
-        && nals.iter().all(|nal| nal.len() <= RTP_MTU)
-        && stap_a_payload_size(nals) <= RTP_MTU
-}
-
-fn build_stap_a(nals: &[&[u8]]) -> Vec<u8> {
-    let nri = nals
-        .iter()
-        .map(|nal| nal[0] & 0x60)
-        .max()
-        .unwrap_or(0);
-    let mut payload = Vec::with_capacity(stap_a_payload_size(nals));
-    payload.push(nri | 24);
-    for nal in nals {
-        payload.extend_from_slice(&(nal.len() as u16).to_be_bytes());
-        payload.extend_from_slice(nal);
+/// Map wall-clock elapsed time to 90 kHz RTP timestamps (variable device fps).
+fn next_rtp_timestamp(ch: &mut ChannelHub, now: Instant) -> u32 {
+    if ch.stream_epoch.is_none() {
+        ch.stream_epoch = Some(now);
     }
-    payload
+    let epoch = ch.stream_epoch.unwrap();
+    let elapsed = now.duration_since(epoch);
+    let mut ts = (elapsed.as_secs_f64() * RTP_CLOCK_HZ).round() as u32;
+    if ch.timestamp > 0 && ts <= ch.timestamp {
+        ts = ch.timestamp.saturating_add(1);
+    }
+    ch.timestamp = ts;
+    ts
 }
 
-/// STAP-A when the access unit fits (typical PPS+slice); else one RTP packet per NAL.
-/// Parameter sets stay in-band only (no SDP sprop) because PPS changes every frame.
+/// One RTP packet per NAL (marker on last). ffmpeg and most depayers handle this
+/// more reliably than STAP-A for per-frame inline PPS.
 fn packetize_access_unit(
     nals: &[&[u8]],
     timestamp: u32,
@@ -400,17 +379,6 @@ fn packetize_access_unit(
     out: &mut Vec<Vec<u8>>,
 ) {
     if nals.is_empty() {
-        return;
-    }
-    if can_stap_a(nals) {
-        let payload = build_stap_a(nals);
-        out.push(rtp_packet(
-            ch.next_sequence(),
-            timestamp,
-            ssrc,
-            true,
-            &payload,
-        ));
         return;
     }
     for (idx, nal) in nals.iter().enumerate() {
@@ -609,38 +577,53 @@ mod tests {
     }
 
     #[test]
-    fn publish_stap_a_bundles_inline_pps_and_slice() {
+    fn publish_one_rtp_packet_per_nal() {
         let hub = StreamHub::new();
+        let sps = &[0x67, 0x42, 0xe0, 0x1f];
         let pps = &[0x68, 0xce, 0x3c, 0x80];
         let slice = &[0x41, 0x88, 0x84];
         let idr = &[0x65, 0xdd];
         let (_, rx) = hub.subscribe(1).unwrap();
-        hub.publish_annexb(1, &annexb(&[pps, idr]));
+        hub.publish_annexb(1, &annexb(&[pps, sps, idr]));
         drain(&rx);
         hub.publish_annexb(1, &annexb(&[pps, slice]));
         let batch = rx.try_recv().expect("one access unit");
         assert_eq!(recv_batch_count(&rx), 0);
-        assert_eq!(batch.len(), 1);
-        assert_eq!(rtp_payload(&batch[0])[0] & 0x1f, 24);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(rtp_payload(&batch[0])[0] & 0x1f, 7);
+        assert_eq!(rtp_payload(&batch[1])[0] & 0x1f, 8);
+        assert_eq!(rtp_payload(&batch[2])[0] & 0x1f, 1);
+        assert_eq!(batch[2][1] & 0x80, 0x80);
     }
 
     #[test]
-    fn publish_skips_aud_and_keeps_device_nal_order() {
+    fn publish_skips_aud_and_keeps_decode_order() {
         let hub = StreamHub::new();
+        let sps = &[0x67, 0x42, 0xe0, 0x1f];
         let pps = &[0x68, 0x01];
         let aud = &[0x09, 0x10];
         let slice = &[0x41, 0x02];
         let idr = &[0x65, 0xdd];
         let (_, rx) = hub.subscribe(1).unwrap();
-        hub.publish_annexb(1, &annexb(&[pps, idr]));
+        hub.publish_annexb(1, &annexb(&[pps, sps, idr]));
         drain(&rx);
         hub.publish_annexb(1, &annexb(&[pps, aud, slice]));
-        let batch = rx.try_recv().expect("pps+slice stap-a");
-        assert_eq!(batch.len(), 1);
-        let payload = rtp_payload(&batch[0]);
-        assert_eq!(payload[0] & 0x1f, 24);
-        let pps_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
-        assert_eq!(&payload[3..3 + pps_len], pps);
+        let batch = rx.try_recv().expect("pps+slice au");
+        assert_eq!(batch.len(), 3);
+        assert_eq!(rtp_payload(&batch[1])[0] & 0x1f, 8);
+        assert_eq!(rtp_payload(&batch[2])[0] & 0x1f, 1);
+    }
+
+    #[test]
+    fn rtp_timestamp_tracks_wall_clock() {
+        let mut ch = ChannelHub::new();
+        let t0 = Instant::now();
+        let ts0 = next_rtp_timestamp(&mut ch, t0);
+        assert_eq!(ts0, 0);
+        let ts1 = next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(100));
+        assert!(ts1 >= 9000 && ts1 <= 9100);
+        let ts2 = next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(250));
+        assert!(ts2 > ts1);
     }
 
     #[test]
