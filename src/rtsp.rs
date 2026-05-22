@@ -11,9 +11,12 @@ use crate::AppState;
 const RTP_MTU: usize = 1200;
 /// H.264 RTP clock (RFC 6184).
 const RTP_CLOCK_HZ: f64 = 90_000.0;
-/// Minimum spacing between access units (~30 fps cap) so bursty ingress does not
-/// collapse RTP timestamps (stutter / MP4 DTS warnings).
-const RTP_TIMESTAMP_MIN_STEP: u32 = 3_000;
+/// Default step (~15 fps @ 90 kHz). Device ingress is bursty; constant steps keep
+/// playout smooth while EMA slowly tracks real frame spacing.
+const RTP_TIMESTAMP_DEFAULT: u32 = 6_000;
+const RTP_TIMESTAMP_MIN: u32 = 3_000;
+const RTP_TIMESTAMP_MAX: u32 = 90_000;
+const RTP_TIMESTAMP_EMA_ALPHA: f64 = 0.15;
 
 type AccessUnitPackets = Vec<Vec<u8>>;
 
@@ -38,8 +41,9 @@ struct ChannelHub {
     sequence: u16,
     /// Last RTP timestamp sent (monotonic).
     timestamp: u32,
-    /// Wall-clock anchor for variable frame rate (90 kHz).
-    stream_epoch: Option<Instant>,
+    last_au_at: Option<Instant>,
+    /// Smoothed 90 kHz ticks between access units (absorbs MDVR burst delivery).
+    rtp_step_ema: f64,
     access_units_sent: u64,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
@@ -180,7 +184,8 @@ impl ChannelHub {
             next_subscriber: 1,
             sequence: 1,
             timestamp: 0,
-            stream_epoch: None,
+            last_au_at: None,
+            rtp_step_ema: RTP_TIMESTAMP_DEFAULT as f64,
             access_units_sent: 0,
             sps: None,
             pps: None,
@@ -349,18 +354,25 @@ fn collect_rtp_nals<'a>(nals: &'a [&'a [u8]], ch: &mut ChannelHub) -> Vec<&'a [u
     out
 }
 
-/// Wall-clock 90 kHz timestamps with a per-AU floor so variable fps stays monotonic.
+/// Steady RTP timeline from smoothed inter-arrival time (not wall clock).
+/// Wall clock + min-step let timestamps run ahead during TCP bursts, then the
+/// player idles until real time catches up (uneven “half-second” stutter).
 fn next_rtp_timestamp(ch: &mut ChannelHub, now: Instant) -> u32 {
-    if ch.stream_epoch.is_none() {
-        ch.stream_epoch = Some(now);
+    if ch.access_units_sent == 0 {
+        ch.last_au_at = Some(now);
+        ch.access_units_sent = 1;
+        ch.timestamp = 0;
+        return 0;
     }
-    let wall = (now.duration_since(ch.stream_epoch.unwrap()).as_secs_f64() * RTP_CLOCK_HZ).round()
-        as u32;
-    let ts = if ch.access_units_sent == 0 {
-        wall
-    } else {
-        wall.max(ch.timestamp.saturating_add(RTP_TIMESTAMP_MIN_STEP))
-    };
+    let prev = ch.last_au_at.replace(now).unwrap_or(now);
+    let measured = (now.duration_since(prev).as_secs_f64() * RTP_CLOCK_HZ).clamp(1.0, 900_000.0);
+    ch.rtp_step_ema =
+        ch.rtp_step_ema * (1.0 - RTP_TIMESTAMP_EMA_ALPHA) + measured * RTP_TIMESTAMP_EMA_ALPHA;
+    let step = ch
+        .rtp_step_ema
+        .round()
+        .clamp(RTP_TIMESTAMP_MIN as f64, RTP_TIMESTAMP_MAX as f64) as u32;
+    let ts = ch.timestamp.saturating_add(step);
     ch.access_units_sent += 1;
     ch.timestamp = ts;
     ts
@@ -611,25 +623,29 @@ mod tests {
     }
 
     #[test]
-    fn rtp_timestamp_tracks_wall_clock() {
-        let mut ch = ChannelHub::new();
-        let t0 = Instant::now();
-        let ts0 = next_rtp_timestamp(&mut ch, t0);
-        assert_eq!(ts0, 0);
-        let ts1 = next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(100));
-        assert!(ts1 >= 9000 && ts1 <= 9100);
-        let ts2 = next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(250));
-        assert!(ts2 > ts1);
-    }
-
     #[test]
-    fn rtp_timestamp_spaces_bursts_and_tracks_wall_clock() {
+    fn rtp_timestamp_uses_steady_steps_not_wall_clock_bursts() {
         let mut ch = ChannelHub::new();
         let t0 = Instant::now();
         assert_eq!(next_rtp_timestamp(&mut ch, t0), 0);
-        assert_eq!(next_rtp_timestamp(&mut ch, t0), RTP_TIMESTAMP_MIN_STEP);
-        let ts_far = next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(200));
-        assert!(ts_far >= 18_000);
+        let mut last = 0;
+        for _ in 0..8 {
+            last = next_rtp_timestamp(&mut ch, t0);
+        }
+        assert!(last <= 48_000, "burst at same instant should not run timestamps to wall");
+        let spaced = next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(66));
+        assert!(spaced > last);
+    }
+
+    #[test]
+    fn rtp_timestamp_ema_tracks_slow_spacing() {
+        let mut ch = ChannelHub::new();
+        let t0 = Instant::now();
+        next_rtp_timestamp(&mut ch, t0);
+        for i in 0..20 {
+            next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(66 * (i as u64 + 1)));
+        }
+        assert!(ch.rtp_step_ema >= 5_000.0 && ch.rtp_step_ema <= 7_500.0);
     }
 
     #[test]
