@@ -75,3 +75,4 @@ ffplay -rtsp_transport tcp rtsp://localhost:8554/channel/1
 - Login `PASSWD` uses `HMAC-MD5(key="streaming", message=<password>)` as 32 lowercase hex. Supplying an already-hex 32-character password leaves it unchanged for reverse-engineering tests.
 - H.264 is not transcoded. The bridge extracts Annex-B NAL units and packetizes them into RTP, which keeps CPU use low on small Linux devices such as Jetson Nano.
 - The current RTSP server supports interleaved RTP over RTSP/TCP.
+- The RTSP publisher uses receive-time RTP timestamp steps and repeats cached SPS/PPS before IDR frames to help decoders recover from transient corruption without transcoding.
