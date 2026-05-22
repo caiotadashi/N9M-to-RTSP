@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>N9M to RTSP</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <p class="eyebrow">Intelbras MVD bridge</p>
+          <h1>N9M to RTSP</h1>
+        </div>
+        <div class="actions">
+          <button id="startBtn" class="button primary">Start</button>
+          <button id="stopBtn" class="button">Stop</button>
+        </div>
+      </section>
+
+      <section class="status-grid">
+        <div class="panel status-panel">
+          <div class="panel-head">
+            <span>Status</span>
+            <span id="runBadge" class="badge">Idle</span>
+          </div>
+          <p id="statusText" class="status-text">Waiting for stream.</p>
+          <dl class="metrics">
+            <div>
+              <dt>Source</dt>
+              <dd id="sourceText">-</dd>
+            </div>
+            <div>
+              <dt>RTSP base</dt>
+              <dd>rtsp://localhost:8554/channel/{n}</dd>
+            </div>
+          </dl>
+        </div>
+
+        <form id="configForm" class="panel config-panel">
+          <div class="panel-head">
+            <span>Source</span>
+            <button class="button small" type="submit">Save</button>
+          </div>
+          <div class="form-grid">
+            <label>
+              <span>Host</span>
+              <input id="hostInput" name="host" autocomplete="off" />
+            </label>
+            <label>
+              <span>Port</span>
+              <input id="portInput" name="port" type="number" min="1" max="65535" />
+            </label>
+            <label>
+              <span>User</span>
+              <input id="userInput" name="user" autocomplete="username" />
+            </label>
+            <label>
+              <span>Password</span>
+              <input id="passwordInput" name="password" type="password" autocomplete="current-password" />
+            </label>
+            <label class="wide">
+              <span>Stream name</span>
+              <input id="streamNameInput" name="streamName" autocomplete="off" />
+            </label>
+          </div>
+          <div class="channel-toggles">
+            <label><input type="checkbox" data-channel="0" /> CH1</label>
+            <label><input type="checkbox" data-channel="1" /> CH2</label>
+            <label><input type="checkbox" data-channel="2" /> CH3</label>
+            <label><input type="checkbox" data-channel="3" /> CH4</label>
+          </div>
+        </form>
+      </section>
+
+      <section id="channels" class="channels"></section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
+
