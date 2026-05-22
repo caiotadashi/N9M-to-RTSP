@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::AppState;
 
@@ -22,7 +22,6 @@ struct ChannelHub {
     next_subscriber: u64,
     sequence: u16,
     timestamp: u32,
-    last_published_at: Option<Instant>,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
 }
@@ -45,55 +44,28 @@ impl StreamHub {
         if !(1..=4).contains(&channel) {
             return;
         }
-        let nals: Vec<&[u8]> = split_annexb(annexb)
-            .into_iter()
-            .filter(|nal| is_valid_annexb_nal(nal))
-            .collect();
+        let nals = split_annexb(annexb);
         if nals.is_empty() {
             return;
         }
         let mut guard = self.inner.lock().unwrap();
         let ch = &mut guard.channels[channel - 1];
-        let mut has_sps = false;
-        let mut has_pps = false;
-        let mut has_idr = false;
         for nal in &nals {
+            if nal.is_empty() {
+                continue;
+            }
             match nal[0] & 0x1f {
-                5 => has_idr = true,
-                7 => {
-                    has_sps = true;
-                    ch.sps = Some(nal.to_vec());
-                }
-                8 => {
-                    has_pps = true;
-                    ch.pps = Some(nal.to_vec());
-                }
+                7 => ch.sps = Some(nal.to_vec()),
+                8 => ch.pps = Some(nal.to_vec()),
                 _ => {}
             }
         }
-        ch.timestamp = ch.timestamp.wrapping_add(ch.next_timestamp_step());
+        ch.timestamp = ch.timestamp.wrapping_add(3000);
         let timestamp = ch.timestamp;
         let ssrc = 0x4e394d00u32 | channel as u32;
-        let repeat_sps = (has_idr && !has_sps).then(|| ch.sps.clone()).flatten();
-        let repeat_pps = (has_idr && !has_pps).then(|| ch.pps.clone()).flatten();
-        let repeat_count = usize::from(repeat_sps.is_some()) + usize::from(repeat_pps.is_some());
-        let total_nals = repeat_count + nals.len();
-        let mut sent_nals = 0usize;
         let mut packets = Vec::new();
-
-        if let Some(sps) = repeat_sps.as_deref() {
-            sent_nals += 1;
-            let marker = sent_nals == total_nals;
-            packetize_nal(sps, marker, timestamp, ssrc, ch, &mut packets);
-        }
-        if let Some(pps) = repeat_pps.as_deref() {
-            sent_nals += 1;
-            let marker = sent_nals == total_nals;
-            packetize_nal(pps, marker, timestamp, ssrc, ch, &mut packets);
-        }
-        for nal in &nals {
-            sent_nals += 1;
-            let marker = sent_nals == total_nals;
+        for (idx, nal) in nals.iter().enumerate() {
+            let marker = idx + 1 == nals.len();
             packetize_nal(nal, marker, timestamp, ssrc, ch, &mut packets);
         }
         ch.subscribers.retain(|_, tx| {
@@ -187,7 +159,6 @@ impl ChannelHub {
             next_subscriber: 1,
             sequence: 1,
             timestamp: 0,
-            last_published_at: None,
             sps: None,
             pps: None,
         }
@@ -339,21 +310,6 @@ impl ChannelHub {
         self.sequence = self.sequence.wrapping_add(1);
         seq
     }
-
-    fn next_timestamp_step(&mut self) -> u32 {
-        let now = Instant::now();
-        let step = self
-            .last_published_at
-            .map(|previous| duration_to_rtp_ticks(now.saturating_duration_since(previous)))
-            .unwrap_or(6000);
-        self.last_published_at = Some(now);
-        step
-    }
-}
-
-fn duration_to_rtp_ticks(duration: Duration) -> u32 {
-    let ticks = duration.as_micros().saturating_mul(90) / 1000;
-    ticks.clamp(1, 90_000) as u32
 }
 
 fn rtp_packet(seq: u16, timestamp: u32, ssrc: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
@@ -395,13 +351,6 @@ fn split_annexb(data: &[u8]) -> Vec<&[u8]> {
         }
     }
     nals
-}
-
-fn is_valid_annexb_nal(nal: &[u8]) -> bool {
-    if nal.is_empty() || nal[0] & 0x80 != 0 {
-        return false;
-    }
-    matches!(nal[0] & 0x1f, 1..=23)
 }
 
 fn read_rtsp_request(stream: &mut TcpStream) -> std::io::Result<Option<String>> {

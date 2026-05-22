@@ -78,6 +78,11 @@ function renderChannels(channels, running) {
           <div class="stat-row"><span>FPS</span><strong>${formatFps(channel.fps)}</strong></div>
           <div class="stat-row"><span>Bytes</span><strong>${formatBytes(channel.bytes)}</strong></div>
           <div class="stat-row"><span>Clients</span><strong>${channel.clients}</strong></div>
+          <div class="stat-row"><span>Keyframes</span><strong>${channel.idrFrames}</strong></div>
+          <div class="stat-row"><span>NAL units</span><strong>${channel.nalUnits}</strong></div>
+          <div class="stat-row"><span>Multi-NAL</span><strong>${channel.multiNalFrames}</strong></div>
+          <div class="stat-row"><span>Fragmented NALs</span><strong>${channel.fragmentedNals}</strong></div>
+          <div class="stat-row"><span>Max NAL</span><strong>${formatBytes(channel.maxNalBytes)}</strong></div>
           <div class="rtsp-url">${channel.rtspUrl}</div>
         </article>
       `;

@@ -42,6 +42,14 @@ pub struct ChannelStats {
     pub clients: usize,
     pub first_frame_ms: u128,
     pub last_frame_ms: u128,
+    pub nal_units: u64,
+    pub idr_frames: u64,
+    pub sps_units: u64,
+    pub pps_units: u64,
+    pub multi_nal_frames: u64,
+    pub fragmented_nals: u64,
+    pub max_frame_bytes: u64,
+    pub max_nal_bytes: u64,
 }
 
 impl ChannelStats {
@@ -54,6 +62,14 @@ impl ChannelStats {
             clients: 0,
             first_frame_ms: 0,
             last_frame_ms: 0,
+            nal_units: 0,
+            idr_frames: 0,
+            sps_units: 0,
+            pps_units: 0,
+            multi_nal_frames: 0,
+            fragmented_nals: 0,
+            max_frame_bytes: 0,
+            max_nal_bytes: 0,
         }
     }
 
@@ -63,7 +79,25 @@ impl ChannelStats {
         self.clients = 0;
         self.first_frame_ms = 0;
         self.last_frame_ms = 0;
+        self.nal_units = 0;
+        self.idr_frames = 0;
+        self.sps_units = 0;
+        self.pps_units = 0;
+        self.multi_nal_frames = 0;
+        self.fragmented_nals = 0;
+        self.max_frame_bytes = 0;
+        self.max_nal_bytes = 0;
     }
+}
+
+#[derive(Default)]
+struct H264Summary {
+    nal_units: u64,
+    has_idr: bool,
+    sps_units: u64,
+    pps_units: u64,
+    fragmented_nals: u64,
+    max_nal_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -205,16 +239,26 @@ pub fn run_bridge(
             Ok(Some(pack)) => {
                 if let Some((channel, annexb)) = parse_media_payload(&pack.payload) {
                     if channel <= 4 && cfg.channels[channel - 1] && !annexb.is_empty() {
+                        let h264 = inspect_annexb(&annexb);
                         hub.publish_annexb(channel, &annexb);
                         let mut guard = state.lock().unwrap();
-                        guard.stats[channel - 1].frames += 1;
-                        guard.stats[channel - 1].bytes += annexb.len() as u64;
-                        guard.stats[channel - 1].clients = hub.client_count(channel);
+                        let stats = &mut guard.stats[channel - 1];
+                        stats.frames += 1;
+                        stats.bytes += annexb.len() as u64;
+                        stats.clients = hub.client_count(channel);
+                        stats.nal_units += h264.nal_units;
+                        stats.idr_frames += u64::from(h264.has_idr);
+                        stats.sps_units += h264.sps_units;
+                        stats.pps_units += h264.pps_units;
+                        stats.multi_nal_frames += u64::from(h264.nal_units > 1);
+                        stats.fragmented_nals += h264.fragmented_nals;
+                        stats.max_frame_bytes = stats.max_frame_bytes.max(annexb.len() as u64);
+                        stats.max_nal_bytes = stats.max_nal_bytes.max(h264.max_nal_bytes);
                         let frame_ms = start.elapsed().as_millis();
-                        if guard.stats[channel - 1].first_frame_ms == 0 {
-                            guard.stats[channel - 1].first_frame_ms = frame_ms;
+                        if stats.first_frame_ms == 0 {
+                            stats.first_frame_ms = frame_ms;
                         }
-                        guard.stats[channel - 1].last_frame_ms = frame_ms;
+                        stats.last_frame_ms = frame_ms;
                     }
                 } else if is_json(&pack.payload) {
                     handle_json_package(&mut media, &session, &pack.payload);
@@ -323,6 +367,50 @@ fn find_annexb_start(buf: &[u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn inspect_annexb(data: &[u8]) -> H264Summary {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push((i, 3));
+            i += 3;
+        } else if i + 4 < data.len()
+            && data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1
+        {
+            starts.push((i, 4));
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut summary = H264Summary::default();
+    for (idx, (start, prefix)) in starts.iter().enumerate() {
+        let nal_start = start + prefix;
+        let nal_end = starts.get(idx + 1).map(|(next, _)| *next).unwrap_or(data.len());
+        if nal_start >= nal_end {
+            continue;
+        }
+        let nal = &data[nal_start..nal_end];
+        let nal_len = nal.len() as u64;
+        summary.nal_units += 1;
+        summary.max_nal_bytes = summary.max_nal_bytes.max(nal_len);
+        if nal_len > 1200 {
+            summary.fragmented_nals += 1;
+        }
+        match nal[0] & 0x1f {
+            5 => summary.has_idr = true,
+            7 => summary.sps_units += 1,
+            8 => summary.pps_units += 1,
+            _ => {}
+        }
+    }
+    summary
 }
 
 fn is_json(payload: &[u8]) -> bool {

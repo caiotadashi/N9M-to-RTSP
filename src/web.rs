@@ -133,7 +133,7 @@ fn status_json(state: &AppState, hub: &StreamHub) -> String {
         }
         let fps = channel_fps(stat.frames, stat.first_frame_ms, stat.last_frame_ms);
         channels.push_str(&format!(
-            "{{\"channel\":{},\"enabled\":{},\"frames\":{},\"bytes\":{},\"clients\":{},\"fps\":{:.2},\"lastFrameMs\":{},\"rtspUrl\":\"rtsp://localhost:8554/channel/{}\"}}",
+            "{{\"channel\":{},\"enabled\":{},\"frames\":{},\"bytes\":{},\"clients\":{},\"fps\":{:.2},\"lastFrameMs\":{},\"nalUnits\":{},\"idrFrames\":{},\"spsUnits\":{},\"ppsUnits\":{},\"multiNalFrames\":{},\"fragmentedNals\":{},\"maxFrameBytes\":{},\"maxNalBytes\":{},\"rtspUrl\":\"rtsp://localhost:8554/channel/{}\"}}",
             stat.channel,
             bool_json(config.channels[idx]),
             stat.frames,
@@ -141,6 +141,14 @@ fn status_json(state: &AppState, hub: &StreamHub) -> String {
             stat.clients,
             fps,
             stat.last_frame_ms,
+            stat.nal_units,
+            stat.idr_frames,
+            stat.sps_units,
+            stat.pps_units,
+            stat.multi_nal_frames,
+            stat.fragmented_nals,
+            stat.max_frame_bytes,
+            stat.max_nal_bytes,
             stat.channel
         ));
     }
