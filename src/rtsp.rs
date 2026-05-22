@@ -11,12 +11,9 @@ use crate::AppState;
 const RTP_MTU: usize = 1200;
 /// H.264 RTP clock (RFC 6184).
 const RTP_CLOCK_HZ: f64 = 90_000.0;
-/// Default step (~15 fps @ 90 kHz). Device ingress is bursty; constant steps keep
-/// playout smooth while EMA slowly tracks real frame spacing.
-const RTP_TIMESTAMP_DEFAULT: u32 = 6_000;
-const RTP_TIMESTAMP_MIN: u32 = 3_000;
+/// One 90 kHz tick (~11 µs); avoids inflating sub-ms MDVR bursts to 33 ms.
+const RTP_TIMESTAMP_MIN: u32 = 1;
 const RTP_TIMESTAMP_MAX: u32 = 90_000;
-const RTP_TIMESTAMP_EMA_ALPHA: f64 = 0.15;
 
 type AccessUnitPackets = Vec<Vec<u8>>;
 
@@ -42,8 +39,6 @@ struct ChannelHub {
     /// Last RTP timestamp sent (monotonic).
     timestamp: u32,
     last_au_at: Option<Instant>,
-    /// Smoothed 90 kHz ticks between access units (absorbs MDVR burst delivery).
-    rtp_step_ema: f64,
     access_units_sent: u64,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
@@ -185,7 +180,6 @@ impl ChannelHub {
             sequence: 1,
             timestamp: 0,
             last_au_at: None,
-            rtp_step_ema: RTP_TIMESTAMP_DEFAULT as f64,
             access_units_sent: 0,
             sps: None,
             pps: None,
@@ -280,7 +274,10 @@ fn handle_client(mut stream: TcpStream, hub: StreamHub, _state: AppState) {
                     &[("Session", &session), ("RTP-Info", &rtp_info)],
                     "",
                 );
-                while let Ok(batch) = rx.recv() {
+                while let Ok(mut batch) = rx.recv() {
+                    while let Ok(next) = rx.try_recv() {
+                        batch = next;
+                    }
                     let mut ok = true;
                     for packet in &batch {
                         if write_interleaved_frame(&mut stream, 0, packet).is_err() {
@@ -354,9 +351,7 @@ fn collect_rtp_nals<'a>(nals: &'a [&'a [u8]], ch: &mut ChannelHub) -> Vec<&'a [u
     out
 }
 
-/// Steady RTP timeline from smoothed inter-arrival time (not wall clock).
-/// Wall clock + min-step let timestamps run ahead during TCP bursts, then the
-/// player idles until real time catches up (uneven “half-second” stutter).
+/// RTP step from measured ingress spacing (90 kHz).
 fn next_rtp_timestamp(ch: &mut ChannelHub, now: Instant) -> u32 {
     if ch.access_units_sent == 0 {
         ch.last_au_at = Some(now);
@@ -366,10 +361,7 @@ fn next_rtp_timestamp(ch: &mut ChannelHub, now: Instant) -> u32 {
     }
     let prev = ch.last_au_at.replace(now).unwrap_or(now);
     let measured = (now.duration_since(prev).as_secs_f64() * RTP_CLOCK_HZ).clamp(1.0, 900_000.0);
-    ch.rtp_step_ema =
-        ch.rtp_step_ema * (1.0 - RTP_TIMESTAMP_EMA_ALPHA) + measured * RTP_TIMESTAMP_EMA_ALPHA;
-    let step = ch
-        .rtp_step_ema
+    let step = measured
         .round()
         .clamp(RTP_TIMESTAMP_MIN as f64, RTP_TIMESTAMP_MAX as f64) as u32;
     let ts = ch.timestamp.saturating_add(step);
@@ -623,7 +615,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn rtp_timestamp_uses_steady_steps_not_wall_clock_bursts() {
         let mut ch = ChannelHub::new();
         let t0 = Instant::now();
@@ -638,14 +629,26 @@ mod tests {
     }
 
     #[test]
-    fn rtp_timestamp_ema_tracks_slow_spacing() {
+    fn rtp_timestamp_step_tracks_measured_spacing() {
         let mut ch = ChannelHub::new();
         let t0 = Instant::now();
         next_rtp_timestamp(&mut ch, t0);
+        let mut last_ts = 0;
         for i in 0..20 {
-            next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(66 * (i as u64 + 1)));
+            let prev_ts = last_ts;
+            last_ts = next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(66 * (i as u64 + 1)));
+            let step = last_ts - prev_ts;
+            assert!(step >= 5_000 && step <= 7_500, "66 ms spacing → ~5940 ticks");
         }
-        assert!(ch.rtp_step_ema >= 5_000.0 && ch.rtp_step_ema <= 7_500.0);
+    }
+
+    #[test]
+    fn rtp_timestamp_burst_uses_measured_not_ema_floor() {
+        let mut ch = ChannelHub::new();
+        let t0 = Instant::now();
+        next_rtp_timestamp(&mut ch, t0);
+        let ts = next_rtp_timestamp(&mut ch, t0 + Duration::from_micros(400));
+        assert!(ts < 1_000, "sub-ms burst should not add a full 6000-tick frame");
     }
 
     #[test]
