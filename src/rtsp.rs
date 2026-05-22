@@ -50,22 +50,44 @@ impl StreamHub {
         }
         let mut guard = self.inner.lock().unwrap();
         let ch = &mut guard.channels[channel - 1];
+
+        let mut vcl_nals: Vec<&[u8]> = Vec::new();
+        let mut has_idr = false;
         for nal in &nals {
             if nal.is_empty() {
                 continue;
             }
-            match nal[0] & 0x1f {
-                7 => ch.sps = Some(nal.to_vec()),
-                8 => ch.pps = Some(nal.to_vec()),
+            match nal_type(nal) {
+                Some(7) => ch.sps = Some(nal.to_vec()),
+                Some(8) => ch.pps = Some(nal.to_vec()),
+                Some(1) => vcl_nals.push(nal),
+                Some(5) => {
+                    has_idr = true;
+                    vcl_nals.push(nal);
+                }
                 _ => {}
             }
         }
+        if vcl_nals.is_empty() {
+            return;
+        }
+
         ch.timestamp = ch.timestamp.wrapping_add(3000);
         let timestamp = ch.timestamp;
         let ssrc = 0x4e394d00u32 | channel as u32;
         let mut packets = Vec::new();
-        for (idx, nal) in nals.iter().enumerate() {
-            let marker = idx + 1 == nals.len();
+        if has_idr {
+            let sps = ch.sps.clone();
+            let pps = ch.pps.clone();
+            if let Some(sps) = sps.as_deref() {
+                packetize_nal(sps, false, timestamp, ssrc, ch, &mut packets);
+            }
+            if let Some(pps) = pps.as_deref() {
+                packetize_nal(pps, false, timestamp, ssrc, ch, &mut packets);
+            }
+        }
+        for (idx, nal) in vcl_nals.iter().enumerate() {
+            let marker = idx + 1 == vcl_nals.len();
             packetize_nal(nal, marker, timestamp, ssrc, ch, &mut packets);
         }
         ch.subscribers.retain(|_, tx| {
@@ -94,7 +116,7 @@ impl StreamHub {
             let _ = tx.send(packet);
         }
         if let Some(pps) = ch.pps.clone() {
-            let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, true, &pps);
+            let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, false, &pps);
             let _ = tx.send(packet);
         }
         ch.subscribers.insert(id, tx);
@@ -323,6 +345,10 @@ fn rtp_packet(seq: u16, timestamp: u32, ssrc: u32, marker: bool, payload: &[u8])
     out
 }
 
+fn nal_type(nal: &[u8]) -> Option<u8> {
+    nal.first().map(|b| b & 0x1f)
+}
+
 fn split_annexb(data: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut i = 0;
@@ -430,6 +456,60 @@ fn new_session_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{now:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn annexb(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in parts {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(part);
+        }
+        out
+    }
+
+    fn drain(rx: &Receiver<Vec<u8>>) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    fn recv_count(rx: &Receiver<Vec<u8>>) -> usize {
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn publish_skips_non_vcl_and_packetizes_slice_only() {
+        let hub = StreamHub::new();
+        let sps = &[0x67, 0x42, 0xe0, 0x1f];
+        let pps = &[0x68, 0xce, 0x3c, 0x80];
+        let aud = &[0x09, 0x10];
+        let slice = &[0x41, 0x88, 0x84];
+        hub.publish_annexb(1, &annexb(&[sps, pps]));
+        let (_, rx) = hub.subscribe(1).unwrap();
+        drain(&rx);
+        hub.publish_annexb(1, &annexb(&[aud, slice]));
+        assert_eq!(recv_count(&rx), 1);
+    }
+
+    #[test]
+    fn publish_prepends_cached_parameter_sets_on_idr() {
+        let hub = StreamHub::new();
+        let sps = &[0x67, 0x42, 0xe0, 0x1f];
+        let pps = &[0x68, 0xce, 0x3c, 0x80];
+        let aud = &[0x09, 0x10];
+        let idr = &[0x65, 0xaa, 0xbb];
+        hub.publish_annexb(1, &annexb(&[sps, pps]));
+        let (_, rx) = hub.subscribe(1).unwrap();
+        drain(&rx);
+        hub.publish_annexb(1, &annexb(&[aud, idr]));
+        assert_eq!(recv_count(&rx), 3);
+    }
 }
 
 fn base64(data: &[u8]) -> String {
