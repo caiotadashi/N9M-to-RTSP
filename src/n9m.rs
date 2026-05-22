@@ -430,13 +430,10 @@ fn parse_media_payload(payload: &[u8]) -> Option<(usize, Vec<u8>)> {
         return None;
     }
     let start = annexb_start_offset(payload)?;
-    let video_len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
-    let end = start.saturating_add(video_len).min(payload.len());
-    if end <= start {
-        return None;
-    }
+    // `payload[4..6]` is NOT the Annex-B byte length on live MDVR traffic (pcap:
+    // it truncates ~93% of slice NALs). Use the rest of the `dc` record.
     let channel = payload[0] as usize + 1;
-    Some((channel, payload[start..end].to_vec()))
+    Some((channel, payload[start..].to_vec()))
 }
 
 fn annexb_start_offset(payload: &[u8]) -> Option<usize> {
@@ -684,6 +681,36 @@ impl PacketReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dc_record(channel: u8, annexb: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0u8; 21];
+        payload[0] = channel;
+        payload[1] = b'2';
+        payload[2] = b'd';
+        payload[3] = b'c';
+        // Field at 4..6 is smaller than annexb in captures; must not truncate slice.
+        let short_len = (annexb.len().saturating_sub(4)) as u16;
+        payload[4] = short_len as u8;
+        payload[5] = (short_len >> 8) as u8;
+        payload.extend_from_slice(annexb);
+        payload
+    }
+
+    #[test]
+    fn parse_media_payload_ignores_short_video_len_field() {
+        let pps = [0x68, 0xce, 0x3c, 0x80];
+        let slice = [0x41, 0x9a, 0x24, 0x30];
+        let mut annexb = Vec::new();
+        annexb.extend_from_slice(&[0, 0, 0, 1]);
+        annexb.extend_from_slice(&pps);
+        annexb.extend_from_slice(&[0, 0, 0, 1]);
+        annexb.extend_from_slice(&slice);
+        let payload = dc_record(0, &annexb);
+        let (_, out) = parse_media_payload(&payload).expect("dc frame");
+        assert_eq!(out, annexb);
+        assert!(out.windows(4).any(|w| w == [0, 0, 0, 1]));
+        assert_eq!(out[out.len() - slice.len()..], slice);
+    }
 
     #[test]
     fn json_matches_operation_filters_evem_status() {
