@@ -95,22 +95,9 @@ impl StreamHub {
         let ch = &mut guard.channels[channel - 1];
         let id = ch.next_subscriber;
         ch.next_subscriber += 1;
-        let ssrc = 0x4e394d00u32 | channel as u32;
-        let timestamp = ch.timestamp;
-        let sps = ch.sps.clone();
-        let pps = ch.pps.clone();
-        let mut primer = Vec::new();
-        if let (Some(sps), Some(pps)) = (&sps, &pps) {
-            primer.push(rtp_packet(ch.next_sequence(), timestamp, ssrc, false, sps));
-            primer.push(rtp_packet(ch.next_sequence(), timestamp, ssrc, false, pps));
-        } else if let Some(sps) = &sps {
-            primer.push(rtp_packet(ch.next_sequence(), timestamp, ssrc, true, sps));
-        } else if let Some(pps) = &pps {
-            primer.push(rtp_packet(ch.next_sequence(), timestamp, ssrc, true, pps));
-        }
-        if !primer.is_empty() {
-            let _ = tx.send(primer);
-        }
+        // No out-of-band SPS/PPS burst: MDVR sends new inline PPS every frame.
+        // Stale SDP/primer parameter sets cause "pps_id out of range" in ffmpeg.
+        ch.awaiting_idr = true;
         ch.subscribers.insert(id, tx);
         Some((id, rx))
     }
@@ -137,20 +124,16 @@ impl StreamHub {
     fn sdp(&self, channel: usize, host: &str) -> String {
         let guard = self.inner.lock().unwrap();
         let ch = &guard.channels[channel - 1];
-        let mut fmtp = String::new();
-        if let (Some(sps), Some(pps)) = (&ch.sps, &ch.pps) {
+        let fmtp = if let Some(sps) = &ch.sps {
             let profile = if sps.len() >= 4 {
                 format!("{:02x}{:02x}{:02x}", sps[1], sps[2], sps[3])
             } else {
                 "42e01f".to_string()
             };
-            fmtp = format!(
-                "a=fmtp:96 packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}\r\n",
-                profile,
-                base64(sps),
-                base64(pps)
-            );
-        }
+            format!("a=fmtp:96 packetization-mode=1;profile-level-id={profile}\r\n")
+        } else {
+            "a=fmtp:96 packetization-mode=1\r\n".to_string()
+        };
         format!(
             "v=0\r\n\
              o=- 0 0 IN IP4 {host}\r\n\
@@ -315,8 +298,33 @@ fn collect_rtp_nals<'a>(nals: &'a [&'a [u8]], ch: &mut ChannelHub) -> Vec<&'a [u
     out
 }
 
-/// One RTP packet per NAL (RFC 6184 single-NAL mode). Avoids STAP-A, which many
-/// custom depayers mishandle; matches PPS then slice ordering from the MDVR.
+fn stap_a_payload_size(nals: &[&[u8]]) -> usize {
+    1 + nals.iter().map(|nal| 2 + nal.len()).sum::<usize>()
+}
+
+fn can_stap_a(nals: &[&[u8]]) -> bool {
+    !nals.is_empty()
+        && nals.iter().all(|nal| nal.len() <= RTP_MTU)
+        && stap_a_payload_size(nals) <= RTP_MTU
+}
+
+fn build_stap_a(nals: &[&[u8]]) -> Vec<u8> {
+    let nri = nals
+        .iter()
+        .map(|nal| nal[0] & 0x60)
+        .max()
+        .unwrap_or(0);
+    let mut payload = Vec::with_capacity(stap_a_payload_size(nals));
+    payload.push(nri | 24);
+    for nal in nals {
+        payload.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        payload.extend_from_slice(nal);
+    }
+    payload
+}
+
+/// STAP-A when the access unit fits (typical PPS+slice); else one RTP packet per NAL.
+/// Parameter sets stay in-band only (no SDP sprop) because PPS changes every frame.
 fn packetize_access_unit(
     nals: &[&[u8]],
     timestamp: u32,
@@ -324,6 +332,20 @@ fn packetize_access_unit(
     ch: &mut ChannelHub,
     out: &mut Vec<Vec<u8>>,
 ) {
+    if nals.is_empty() {
+        return;
+    }
+    if can_stap_a(nals) {
+        let payload = build_stap_a(nals);
+        out.push(rtp_packet(
+            ch.next_sequence(),
+            timestamp,
+            ssrc,
+            true,
+            &payload,
+        ));
+        return;
+    }
     for (idx, nal) in nals.iter().enumerate() {
         let marker = idx + 1 == nals.len();
         packetize_nal(nal, marker, timestamp, ssrc, ch, out);
@@ -520,20 +542,19 @@ mod tests {
     }
 
     #[test]
-    fn publish_sends_separate_pps_and_slice_packets() {
+    fn publish_stap_a_bundles_inline_pps_and_slice() {
         let hub = StreamHub::new();
         let pps = &[0x68, 0xce, 0x3c, 0x80];
         let slice = &[0x41, 0x88, 0x84];
         let idr = &[0x65, 0xdd];
-        hub.publish_annexb(1, &annexb(&[pps, idr]));
         let (_, rx) = hub.subscribe(1).unwrap();
+        hub.publish_annexb(1, &annexb(&[pps, idr]));
         drain(&rx);
         hub.publish_annexb(1, &annexb(&[pps, slice]));
         let batch = rx.try_recv().expect("one access unit");
         assert_eq!(recv_batch_count(&rx), 0);
-        assert_eq!(batch.len(), 2);
-        assert_eq!(rtp_payload(&batch[0])[0] & 0x1f, 8);
-        assert_eq!(rtp_payload(&batch[1])[0] & 0x1f, 1);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(rtp_payload(&batch[0])[0] & 0x1f, 24);
     }
 
     #[test]
@@ -543,38 +564,15 @@ mod tests {
         let aud = &[0x09, 0x10];
         let slice = &[0x41, 0x02];
         let idr = &[0x65, 0xdd];
-        hub.publish_annexb(1, &annexb(&[pps, idr]));
         let (_, rx) = hub.subscribe(1).unwrap();
+        hub.publish_annexb(1, &annexb(&[pps, idr]));
         drain(&rx);
         hub.publish_annexb(1, &annexb(&[pps, aud, slice]));
-        let batch = rx.try_recv().expect("pps+slice packets");
-        assert_eq!(batch.len(), 2);
-        assert_eq!(rtp_payload(&batch[0]), pps);
-        assert_eq!(rtp_payload(&batch[1]), slice);
+        let batch = rx.try_recv().expect("pps+slice stap-a");
+        assert_eq!(batch.len(), 1);
+        let payload = rtp_payload(&batch[0]);
+        assert_eq!(payload[0] & 0x1f, 24);
+        let pps_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
+        assert_eq!(&payload[3..3 + pps_len], pps);
     }
-}
-
-fn base64(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    let mut i = 0;
-    while i < data.len() {
-        let b0 = data[i];
-        let b1 = *data.get(i + 1).unwrap_or(&0);
-        let b2 = *data.get(i + 2).unwrap_or(&0);
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        if i + 1 < data.len() {
-            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if i + 2 < data.len() {
-            out.push(TABLE[(b2 & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        i += 3;
-    }
-    out
 }
