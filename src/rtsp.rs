@@ -4,13 +4,16 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::AppState;
 
 const RTP_MTU: usize = 1200;
-/// 90 kHz clock at ~15 fps (matches observed device rate).
+/// Default 90 kHz step when the first frame arrives (~15 fps).
 const RTP_TIMESTAMP_STEP: u32 = 6000;
+/// Clamp wall-clock deltas (10 fps – 2 s) in 90 kHz units.
+const RTP_TIMESTAMP_MIN: u32 = 9000;
+const RTP_TIMESTAMP_MAX: u32 = 180_000;
 
 type AccessUnitPackets = Vec<Vec<u8>>;
 
@@ -23,15 +26,20 @@ struct HubInner {
     channels: [ChannelHub; 4],
 }
 
+struct RtspSubscriber {
+    sender: Sender<AccessUnitPackets>,
+    /// Skip access units until the first IDR after this client connects.
+    needs_idr: bool,
+}
+
 struct ChannelHub {
-    subscribers: HashMap<u64, Sender<AccessUnitPackets>>,
+    subscribers: HashMap<u64, RtspSubscriber>,
     next_subscriber: u64,
     sequence: u16,
     timestamp: u32,
+    last_au_at: Option<Instant>,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
-    /// Drop P-frames until the first IDR so decoders lock parameter sets.
-    awaiting_idr: bool,
 }
 
 impl StreamHub {
@@ -59,7 +67,7 @@ impl StreamHub {
         let mut guard = self.inner.lock().unwrap();
         let ch = &mut guard.channels[channel - 1];
 
-        let rtp_nals = collect_rtp_nals(&nals, ch);
+        let rtp_nals = reorder_nals_for_decode(collect_rtp_nals(&nals, ch));
         let has_idr = rtp_nals
             .iter()
             .any(|nal| matches!(nal_type(nal), Some(5)));
@@ -69,23 +77,32 @@ impl StreamHub {
         if !has_idr && !has_pframe {
             return;
         }
-        if ch.awaiting_idr {
-            if has_idr {
-                ch.awaiting_idr = false;
-            } else {
-                return;
-            }
-        }
 
-        ch.timestamp = ch.timestamp.wrapping_add(RTP_TIMESTAMP_STEP);
+        let now = Instant::now();
+        let step = ch
+            .last_au_at
+            .map(|prev| {
+                let ms = now.duration_since(prev).as_millis() as u32;
+                (ms.saturating_mul(90)).clamp(RTP_TIMESTAMP_MIN, RTP_TIMESTAMP_MAX)
+            })
+            .unwrap_or(RTP_TIMESTAMP_STEP);
+        ch.last_au_at = Some(now);
+        ch.timestamp = ch.timestamp.wrapping_add(step);
         let timestamp = ch.timestamp;
         let ssrc = 0x4e394d00u32 | channel as u32;
         let au_nals = build_access_unit_nals(ch, &rtp_nals);
         let au_refs: Vec<&[u8]> = au_nals.iter().map(Vec::as_slice).collect();
         let mut packets = Vec::new();
         packetize_access_unit(&au_refs, timestamp, ssrc, ch, &mut packets);
-        ch.subscribers
-            .retain(|_, tx| tx.send(packets.clone()).is_ok());
+        ch.subscribers.retain(|_, sub| {
+            if sub.needs_idr {
+                if !has_idr {
+                    return true;
+                }
+                sub.needs_idr = false;
+            }
+            sub.sender.send(packets.clone()).is_ok()
+        });
     }
 
     pub fn subscribe(&self, channel: usize) -> Option<(u64, Receiver<AccessUnitPackets>)> {
@@ -97,10 +114,13 @@ impl StreamHub {
         let ch = &mut guard.channels[channel - 1];
         let id = ch.next_subscriber;
         ch.next_subscriber += 1;
-        // No out-of-band SPS/PPS burst: MDVR sends new inline PPS every frame.
-        // Stale SDP/primer parameter sets cause "pps_id out of range" in ffmpeg.
-        ch.awaiting_idr = true;
-        ch.subscribers.insert(id, tx);
+        ch.subscribers.insert(
+            id,
+            RtspSubscriber {
+                sender: tx,
+                needs_idr: true,
+            },
+        );
         Some((id, rx))
     }
 
@@ -162,9 +182,9 @@ impl ChannelHub {
             next_subscriber: 1,
             sequence: 1,
             timestamp: 0,
+            last_au_at: None,
             sps: None,
             pps: None,
-            awaiting_idr: true,
         }
     }
 }
@@ -283,6 +303,30 @@ fn handle_client(mut stream: TcpStream, hub: StreamHub, _state: AppState) {
     if let Some((ch, sub_id)) = subscribed {
         hub.unsubscribe(ch, sub_id);
     }
+}
+
+/// MDVR IDR access units often arrive as `PPS, SPS, PPS, SEI, IDR`. ffmpeg needs SPS
+/// before the first PPS of the access unit.
+fn reorder_nals_for_decode<'a>(nals: Vec<&'a [u8]>) -> Vec<&'a [u8]> {
+    let mut sps = Vec::new();
+    let mut pps = Vec::new();
+    let mut sei = Vec::new();
+    let mut vcl = Vec::new();
+    for nal in nals {
+        match nal_type(nal) {
+            Some(7) => sps.push(nal),
+            Some(8) => pps.push(nal),
+            Some(6) => sei.push(nal),
+            Some(1) | Some(5) => vcl.push(nal),
+            _ => {}
+        }
+    }
+    let mut out = Vec::with_capacity(sps.len() + pps.len() + sei.len() + vcl.len());
+    out.extend(sps);
+    out.extend(pps);
+    out.extend(sei);
+    out.extend(vcl);
+    out
 }
 
 /// MDVR P-frames are usually `PPS + slice` without SPS. Decoders still need the
@@ -597,6 +641,20 @@ mod tests {
         assert_eq!(payload[0] & 0x1f, 24);
         let pps_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
         assert_eq!(&payload[3..3 + pps_len], pps);
+    }
+
+    #[test]
+    fn reorder_puts_sps_before_leading_pps_on_idr() {
+        let pps1 = &[0x68, 0x01];
+        let sps = &[0x67, 0x42, 0xe0, 0x1f];
+        let pps2 = &[0x68, 0x02];
+        let idr = &[0x65, 0x88];
+        let ordered = reorder_nals_for_decode(vec![pps1, sps, pps2, idr]);
+        assert_eq!(ordered.len(), 4);
+        assert_eq!(ordered[0], sps);
+        assert_eq!(ordered[1], pps1);
+        assert_eq!(ordered[2], pps2);
+        assert_eq!(ordered[3], idr);
     }
 
     #[test]
