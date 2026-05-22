@@ -303,7 +303,14 @@ fn start_live_channel(
         ),
     )?;
 
-    let response = read_json_response(stream, stop)?;
+    let response = read_json_for_operation(
+        stream,
+        stop,
+        session,
+        "MEDIASTREAMMODEL",
+        "REQUESTALIVEVIDEO",
+        Duration::from_secs(15),
+    )?;
     if json_get_u64(&response, "ERRORCODE").unwrap_or(0) != 0 {
         return Err(format!("REQUESTALIVEVIDEO failed for channel {channel}: {response}"));
     }
@@ -367,11 +374,37 @@ fn handle_json_package(stream: &mut TcpStream, session: &str, payload: &[u8]) {
 }
 
 fn read_json_response(stream: &mut TcpStream, stop: &Arc<AtomicBool>) -> Result<String, String> {
+    read_json_for_operation(stream, stop, "", "", "", Duration::from_secs(30))
+}
+
+fn read_json_for_operation(
+    stream: &mut TcpStream,
+    stop: &Arc<AtomicBool>,
+    session: &str,
+    module: &str,
+    operation: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let mut reader = PacketReader::new();
+    let deadline = Instant::now() + timeout;
+    let filter = !module.is_empty() && !operation.is_empty();
     loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for {module}.{operation} on control socket"
+            ));
+        }
         match reader.read_package(stream, stop)? {
             Some(pack) if is_json(&pack.payload) => {
-                return Ok(String::from_utf8_lossy(trim_nul(&pack.payload)).to_string());
+                let text = String::from_utf8_lossy(trim_nul(&pack.payload)).to_string();
+                if filter {
+                    if json_matches_operation(&text, module, operation) {
+                        return Ok(text);
+                    }
+                    handle_json_package(stream, session, &pack.payload);
+                    continue;
+                }
+                return Ok(text);
             }
             Some(_) => {}
             None => {
@@ -381,6 +414,11 @@ fn read_json_response(stream: &mut TcpStream, stop: &Arc<AtomicBool>) -> Result<
             }
         }
     }
+}
+
+fn json_matches_operation(json: &str, module: &str, operation: &str) -> bool {
+    json_get_string(json, "MODULE").as_deref() == Some(module)
+        && json_get_string(json, "OPERATION").as_deref() == Some(operation)
 }
 
 fn parse_media_payload(payload: &[u8]) -> Option<(usize, Vec<u8>)> {
@@ -628,5 +666,22 @@ impl PacketReader {
             return Ok(Some(Package { payload }));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_matches_operation_filters_evem_status() {
+        let evem = r#"{"MODULE":"EVEM","OPERATION":"SENDRECORDSTATUS","PARAMETER":{},"SESSION":"x"}"#;
+        let alive = r#"{"MODULE":"MEDIASTREAMMODEL","OPERATION":"REQUESTALIVEVIDEO","RESPONSE":{"ERRORCODE":0,"SSRC":3},"SESSION":"x"}"#;
+        assert!(!json_matches_operation(evem, "MEDIASTREAMMODEL", "REQUESTALIVEVIDEO"));
+        assert!(json_matches_operation(
+            alive,
+            "MEDIASTREAMMODEL",
+            "REQUESTALIVEVIDEO"
+        ));
     }
 }
