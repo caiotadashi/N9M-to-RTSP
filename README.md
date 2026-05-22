@@ -2,6 +2,37 @@
 
 Single-binary bridge for Intelbras/GIEC N9M live video streams. It connects to the MVD device on TCP `9006`, performs the certificate handshake, requests live H.264 channels, and serves each channel as RTSP over TCP.
 
+## Setup
+
+This project builds with Rust. If `cargo run --release` prints `cargo: command not found`, install Rust first.
+
+### Linux / Jetson
+
+On Ubuntu, Debian, Jetson Nano, or Jetson Orin:
+
+```bash
+sudo apt update
+sudo apt install -y curl ca-certificates build-essential
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+
+cargo --version
+```
+
+### macOS
+
+Install Apple's command line tools and Rust:
+
+```bash
+xcode-select --install
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+
+cargo --version
+```
+
 ## Run
 
 Copy the public-safe example config and fill in the private device values:
