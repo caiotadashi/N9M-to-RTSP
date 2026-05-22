@@ -11,6 +11,9 @@ use crate::AppState;
 const RTP_MTU: usize = 1200;
 /// H.264 RTP clock (RFC 6184).
 const RTP_CLOCK_HZ: f64 = 90_000.0;
+/// Minimum spacing between access units (~30 fps cap) so bursty ingress does not
+/// collapse RTP timestamps (stutter / MP4 DTS warnings).
+const RTP_TIMESTAMP_MIN_STEP: u32 = 3_000;
 
 type AccessUnitPackets = Vec<Vec<u8>>;
 
@@ -37,6 +40,7 @@ struct ChannelHub {
     timestamp: u32,
     /// Wall-clock anchor for variable frame rate (90 kHz).
     stream_epoch: Option<Instant>,
+    access_units_sent: u64,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
 }
@@ -93,22 +97,14 @@ impl StreamHub {
         });
     }
 
-    /// Out-of-band SPS+PPS burst for a new RTSP client (matched pair from the last IDR).
-    /// Needed for `ffmpeg -c:v copy` MP4 muxing before the next IDR arrives.
-    pub fn parameter_set_primer(&self, channel: usize) -> Option<AccessUnitPackets> {
-        if !(1..=4).contains(&channel) {
-            return None;
-        }
-        let mut guard = self.inner.lock().ok()?;
-        let ch = &mut guard.channels[channel - 1];
-        let sps = ch.sps.clone()?;
-        let pps = ch.pps.clone()?;
-        let timestamp = ch.timestamp;
-        let ssrc = 0x4e394d00u32 | channel as u32;
-        let mut out = Vec::new();
-        packetize_nal(&sps, false, timestamp, ssrc, ch, &mut out);
-        packetize_nal(&pps, true, timestamp, ssrc, ch, &mut out);
-        Some(out)
+    pub fn play_rtp_info(&self, channel: usize) -> (u16, u32) {
+        self.inner
+            .lock()
+            .map(|guard| {
+                let ch = &guard.channels[channel - 1];
+                (ch.sequence, ch.timestamp)
+            })
+            .unwrap_or((1, 0))
     }
 
     pub fn subscribe(&self, channel: usize) -> Option<(u64, Receiver<AccessUnitPackets>)> {
@@ -155,20 +151,12 @@ impl StreamHub {
         let profile = ch.sps.as_ref().and_then(|sps| {
             (sps.len() >= 4).then(|| format!("{:02x}{:02x}{:02x}", sps[1], sps[2], sps[3]))
         });
-        let fmtp = match (&ch.sps, &ch.pps) {
-            (Some(sps), Some(pps)) => {
-                let profile = profile.as_deref().unwrap_or("42e01f");
-                format!(
-                    "a=fmtp:96 packetization-mode=1;profile-level-id={profile};sprop-parameter-sets={},{}\r\n",
-                    base64(sps),
-                    base64(pps)
-                )
-            }
-            (Some(_), None) => {
-                let profile = profile.as_deref().unwrap_or("42e01f");
-                format!("a=fmtp:96 packetization-mode=1;profile-level-id={profile}\r\n")
-            }
-            _ => "a=fmtp:96 packetization-mode=1\r\n".to_string(),
+        // No SDP sprop: MDVR PPS changes every frame; stale extradata breaks ffmpeg
+        // ("Error decoding the extradata") while live RTSP stays fine.
+        let fmtp = if let Some(profile) = profile {
+            format!("a=fmtp:96 packetization-mode=1;profile-level-id={profile}\r\n")
+        } else {
+            "a=fmtp:96 packetization-mode=1\r\n".to_string()
         };
         format!(
             "v=0\r\n\
@@ -193,6 +181,7 @@ impl ChannelHub {
             sequence: 1,
             timestamp: 0,
             stream_epoch: None,
+            access_units_sent: 0,
             sps: None,
             pps: None,
         }
@@ -277,19 +266,15 @@ fn handle_client(mut stream: TcpStream, hub: StreamHub, _state: AppState) {
                     }
                 };
                 subscribed = Some((channel, id));
+                let (seq, rtptime) = hub.play_rtp_info(channel);
+                let rtp_info = format!("url=trackID=0;seq={seq};rtptime={rtptime}");
                 let _ = write_response(
                     &mut stream,
                     200,
                     cseq,
-                    &[("Session", &session), ("RTP-Info", "url=trackID=0;seq=0;rtptime=0")],
+                    &[("Session", &session), ("RTP-Info", &rtp_info)],
                     "",
                 );
-                if let Some(primer) = hub.parameter_set_primer(channel) {
-                    for packet in &primer {
-                        let _ = write_interleaved_frame(&mut stream, 0, packet);
-                    }
-                    let _ = stream.flush();
-                }
                 while let Ok(batch) = rx.recv() {
                     let mut ok = true;
                     for packet in &batch {
@@ -364,17 +349,19 @@ fn collect_rtp_nals<'a>(nals: &'a [&'a [u8]], ch: &mut ChannelHub) -> Vec<&'a [u
     out
 }
 
-/// Map wall-clock elapsed time to 90 kHz RTP timestamps (variable device fps).
+/// Wall-clock 90 kHz timestamps with a per-AU floor so variable fps stays monotonic.
 fn next_rtp_timestamp(ch: &mut ChannelHub, now: Instant) -> u32 {
     if ch.stream_epoch.is_none() {
         ch.stream_epoch = Some(now);
     }
-    let epoch = ch.stream_epoch.unwrap();
-    let elapsed = now.duration_since(epoch);
-    let mut ts = (elapsed.as_secs_f64() * RTP_CLOCK_HZ).round() as u32;
-    if ch.timestamp > 0 && ts <= ch.timestamp {
-        ts = ch.timestamp.saturating_add(1);
-    }
+    let wall = (now.duration_since(ch.stream_epoch.unwrap()).as_secs_f64() * RTP_CLOCK_HZ).round()
+        as u32;
+    let ts = if ch.access_units_sent == 0 {
+        wall
+    } else {
+        wall.max(ch.timestamp.saturating_add(RTP_TIMESTAMP_MIN_STEP))
+    };
+    ch.access_units_sent += 1;
     ch.timestamp = ts;
     ts
 }
@@ -636,17 +623,13 @@ mod tests {
     }
 
     #[test]
-    fn parameter_set_primer_emits_sps_then_pps() {
-        let hub = StreamHub::new();
-        let pps = &[0x68, 0x01];
-        let sps = &[0x67, 0x42, 0xe0, 0x1f];
-        let idr = &[0x65, 0x88];
-        hub.publish_annexb(1, &annexb(&[pps, sps, idr]));
-        let primer = hub.parameter_set_primer(1).expect("primer");
-        assert_eq!(primer.len(), 2);
-        assert_eq!(primer[0][12] & 0x1f, 7);
-        assert_eq!(primer[1][12] & 0x1f, 8);
-        assert_ne!(primer[1][1] & 0x80, 0);
+    fn rtp_timestamp_spaces_bursts_and_tracks_wall_clock() {
+        let mut ch = ChannelHub::new();
+        let t0 = Instant::now();
+        assert_eq!(next_rtp_timestamp(&mut ch, t0), 0);
+        assert_eq!(next_rtp_timestamp(&mut ch, t0), RTP_TIMESTAMP_MIN_STEP);
+        let ts_far = next_rtp_timestamp(&mut ch, t0 + Duration::from_millis(200));
+        assert!(ts_far >= 18_000);
     }
 
     #[test]
@@ -663,30 +646,4 @@ mod tests {
         assert_eq!(ordered[3], idr);
     }
 
-}
-
-fn base64(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    let mut i = 0;
-    while i < data.len() {
-        let b0 = data[i];
-        let b1 = *data.get(i + 1).unwrap_or(&0);
-        let b2 = *data.get(i + 2).unwrap_or(&0);
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        if i + 1 < data.len() {
-            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if i + 2 < data.len() {
-            out.push(TABLE[(b2 & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        i += 3;
-    }
-    out
 }
