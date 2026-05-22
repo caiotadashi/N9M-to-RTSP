@@ -8,6 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::AppState;
 
+const RTP_MTU: usize = 1200;
+/// 90 kHz clock at ~15 fps (matches observed device rate).
+const RTP_TIMESTAMP_STEP: u32 = 6000;
+
 #[derive(Clone)]
 pub struct StreamHub {
     inner: Arc<Mutex<HubInner>>,
@@ -51,45 +55,16 @@ impl StreamHub {
         let mut guard = self.inner.lock().unwrap();
         let ch = &mut guard.channels[channel - 1];
 
-        let mut vcl_nals: Vec<&[u8]> = Vec::new();
-        let mut has_idr = false;
-        for nal in &nals {
-            if nal.is_empty() {
-                continue;
-            }
-            match nal_type(nal) {
-                Some(7) => ch.sps = Some(nal.to_vec()),
-                Some(8) => ch.pps = Some(nal.to_vec()),
-                Some(1) => vcl_nals.push(nal),
-                Some(5) => {
-                    has_idr = true;
-                    vcl_nals.push(nal);
-                }
-                _ => {}
-            }
-        }
-        if vcl_nals.is_empty() {
+        let rtp_nals = collect_rtp_nals(&nals, ch);
+        if !rtp_nals.iter().any(|nal| matches!(nal_type(nal), Some(1) | Some(5))) {
             return;
         }
 
-        ch.timestamp = ch.timestamp.wrapping_add(3000);
+        ch.timestamp = ch.timestamp.wrapping_add(RTP_TIMESTAMP_STEP);
         let timestamp = ch.timestamp;
         let ssrc = 0x4e394d00u32 | channel as u32;
         let mut packets = Vec::new();
-        if has_idr {
-            let sps = ch.sps.clone();
-            let pps = ch.pps.clone();
-            if let Some(sps) = sps.as_deref() {
-                packetize_nal(sps, false, timestamp, ssrc, ch, &mut packets);
-            }
-            if let Some(pps) = pps.as_deref() {
-                packetize_nal(pps, false, timestamp, ssrc, ch, &mut packets);
-            }
-        }
-        for (idx, nal) in vcl_nals.iter().enumerate() {
-            let marker = idx + 1 == vcl_nals.len();
-            packetize_nal(nal, marker, timestamp, ssrc, ch, &mut packets);
-        }
+        packetize_access_unit(&rtp_nals, timestamp, ssrc, ch, &mut packets);
         ch.subscribers.retain(|_, tx| {
             for packet in &packets {
                 if tx.send(packet.clone()).is_err() {
@@ -296,12 +271,81 @@ fn handle_client(mut stream: TcpStream, hub: StreamHub, _state: AppState) {
     }
 }
 
+fn collect_rtp_nals<'a>(nals: &'a [&'a [u8]], ch: &mut ChannelHub) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+    for nal in nals {
+        if nal.is_empty() {
+            continue;
+        }
+        match nal_type(nal) {
+            Some(7) => {
+                ch.sps = Some(nal.to_vec());
+                out.push(*nal);
+            }
+            Some(8) => {
+                ch.pps = Some(nal.to_vec());
+                out.push(*nal);
+            }
+            Some(1) | Some(5) => out.push(*nal),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn stap_a_payload_size(nals: &[&[u8]]) -> usize {
+    1 + nals.iter().map(|nal| 2 + nal.len()).sum::<usize>()
+}
+
+fn can_stap_a(nals: &[&[u8]]) -> bool {
+    !nals.is_empty()
+        && nals.iter().all(|nal| nal.len() <= RTP_MTU)
+        && stap_a_payload_size(nals) <= RTP_MTU
+}
+
+fn build_stap_a(nals: &[&[u8]]) -> Vec<u8> {
+    let nri = nals.first().map(|nal| nal[0] & 0x60).unwrap_or(0);
+    let mut payload = Vec::with_capacity(stap_a_payload_size(nals));
+    payload.push(nri | 24);
+    for nal in nals {
+        payload.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        payload.extend_from_slice(nal);
+    }
+    payload
+}
+
+fn packetize_access_unit(
+    nals: &[&[u8]],
+    timestamp: u32,
+    ssrc: u32,
+    ch: &mut ChannelHub,
+    out: &mut Vec<Vec<u8>>,
+) {
+    if nals.is_empty() {
+        return;
+    }
+    if can_stap_a(nals) {
+        let payload = build_stap_a(nals);
+        out.push(rtp_packet(
+            ch.next_sequence(),
+            timestamp,
+            ssrc,
+            true,
+            &payload,
+        ));
+        return;
+    }
+    for (idx, nal) in nals.iter().enumerate() {
+        let marker = idx + 1 == nals.len();
+        packetize_nal(nal, marker, timestamp, ssrc, ch, out);
+    }
+}
+
 fn packetize_nal(nal: &[u8], marker: bool, timestamp: u32, ssrc: u32, ch: &mut ChannelHub, out: &mut Vec<Vec<u8>>) {
-    const MTU: usize = 1200;
     if nal.is_empty() {
         return;
     }
-    if nal.len() <= MTU {
+    if nal.len() <= RTP_MTU {
         out.push(rtp_packet(ch.next_sequence(), timestamp, ssrc, marker, nal));
         return;
     }
@@ -310,7 +354,7 @@ fn packetize_nal(nal: &[u8], marker: bool, timestamp: u32, ssrc: u32, ch: &mut C
     let nal_type = nal_header & 0x1f;
     let fu_indicator = nri | 28;
     let mut offset = 1;
-    let max_payload = MTU - 2;
+    let max_payload = RTP_MTU - 2;
     while offset < nal.len() {
         let remaining = nal.len() - offset;
         let take = remaining.min(max_payload);
@@ -483,32 +527,39 @@ mod tests {
         n
     }
 
-    #[test]
-    fn publish_skips_non_vcl_and_packetizes_slice_only() {
-        let hub = StreamHub::new();
-        let sps = &[0x67, 0x42, 0xe0, 0x1f];
-        let pps = &[0x68, 0xce, 0x3c, 0x80];
-        let aud = &[0x09, 0x10];
-        let slice = &[0x41, 0x88, 0x84];
-        hub.publish_annexb(1, &annexb(&[sps, pps]));
-        let (_, rx) = hub.subscribe(1).unwrap();
-        drain(&rx);
-        hub.publish_annexb(1, &annexb(&[aud, slice]));
-        assert_eq!(recv_count(&rx), 1);
+    fn rtp_payload(packet: &[u8]) -> &[u8] {
+        &packet[12..]
     }
 
     #[test]
-    fn publish_prepends_cached_parameter_sets_on_idr() {
+    fn publish_stap_a_bundles_inline_pps_and_slice() {
         let hub = StreamHub::new();
-        let sps = &[0x67, 0x42, 0xe0, 0x1f];
         let pps = &[0x68, 0xce, 0x3c, 0x80];
-        let aud = &[0x09, 0x10];
-        let idr = &[0x65, 0xaa, 0xbb];
-        hub.publish_annexb(1, &annexb(&[sps, pps]));
+        let slice = &[0x41, 0x88, 0x84];
+        hub.publish_annexb(1, &annexb(&[pps, slice]));
         let (_, rx) = hub.subscribe(1).unwrap();
         drain(&rx);
-        hub.publish_annexb(1, &annexb(&[aud, idr]));
-        assert_eq!(recv_count(&rx), 3);
+        hub.publish_annexb(1, &annexb(&[pps, slice]));
+        let packet = rx.try_recv().expect("one stap-a frame");
+        assert_eq!(recv_count(&rx), 0);
+        assert_eq!(rtp_payload(&packet)[0] & 0x1f, 24);
+    }
+
+    #[test]
+    fn publish_skips_aud_and_keeps_device_nal_order() {
+        let hub = StreamHub::new();
+        let pps = &[0x68, 0x01];
+        let aud = &[0x09, 0x10];
+        let slice = &[0x41, 0x02];
+        hub.publish_annexb(1, &annexb(&[pps, aud, slice]));
+        let (_, rx) = hub.subscribe(1).unwrap();
+        drain(&rx);
+        hub.publish_annexb(1, &annexb(&[pps, aud, slice]));
+        let packet = rx.try_recv().expect("pps+slice stap-a");
+        let payload = rtp_payload(&packet);
+        assert_eq!(payload[0] & 0x1f, 24);
+        let pps_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
+        assert_eq!(&payload[3..3 + pps_len], pps);
     }
 }
 
