@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,6 +11,10 @@ use crate::AppState;
 const RTP_MTU: usize = 1200;
 /// 90 kHz clock at ~15 fps (matches observed device rate).
 const RTP_TIMESTAMP_STEP: u32 = 6000;
+/// N9M `dc` records place Annex-B at a fixed offset in the capture (400/401 packets).
+const N9M_DC_ANNEXB_OFFSET: usize = 21;
+
+type AccessUnitPackets = Vec<Vec<u8>>;
 
 #[derive(Clone)]
 pub struct StreamHub {
@@ -22,12 +26,14 @@ struct HubInner {
 }
 
 struct ChannelHub {
-    subscribers: HashMap<u64, Sender<Vec<u8>>>,
+    subscribers: HashMap<u64, SyncSender<AccessUnitPackets>>,
     next_subscriber: u64,
     sequence: u16,
     timestamp: u32,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+    /// Drop P-frames until the first IDR so decoders lock parameter sets.
+    awaiting_idr: bool,
 }
 
 impl StreamHub {
@@ -56,8 +62,21 @@ impl StreamHub {
         let ch = &mut guard.channels[channel - 1];
 
         let rtp_nals = collect_rtp_nals(&nals, ch);
-        if !rtp_nals.iter().any(|nal| matches!(nal_type(nal), Some(1) | Some(5))) {
+        let has_idr = rtp_nals
+            .iter()
+            .any(|nal| matches!(nal_type(nal), Some(5)));
+        let has_pframe = rtp_nals
+            .iter()
+            .any(|nal| matches!(nal_type(nal), Some(1)));
+        if !has_idr && !has_pframe {
             return;
+        }
+        if ch.awaiting_idr {
+            if has_idr {
+                ch.awaiting_idr = false;
+            } else {
+                return;
+            }
         }
 
         ch.timestamp = ch.timestamp.wrapping_add(RTP_TIMESTAMP_STEP);
@@ -65,21 +84,14 @@ impl StreamHub {
         let ssrc = 0x4e394d00u32 | channel as u32;
         let mut packets = Vec::new();
         packetize_access_unit(&rtp_nals, timestamp, ssrc, ch, &mut packets);
-        ch.subscribers.retain(|_, tx| {
-            for packet in &packets {
-                if tx.send(packet.clone()).is_err() {
-                    return false;
-                }
-            }
-            true
-        });
+        ch.subscribers.retain(|_, tx| push_access_unit(tx, &packets));
     }
 
-    pub fn subscribe(&self, channel: usize) -> Option<(u64, Receiver<Vec<u8>>)> {
+    pub fn subscribe(&self, channel: usize) -> Option<(u64, Receiver<AccessUnitPackets>)> {
         if !(1..=4).contains(&channel) {
             return None;
         }
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(2);
         let mut guard = self.inner.lock().ok()?;
         let ch = &mut guard.channels[channel - 1];
         let id = ch.next_subscriber;
@@ -88,24 +100,29 @@ impl StreamHub {
         let timestamp = ch.timestamp;
         let sps = ch.sps.clone();
         let pps = ch.pps.clone();
+        let mut primer = Vec::new();
         if let (Some(sps), Some(pps)) = (&sps, &pps) {
             let nals = [sps.as_slice(), pps.as_slice()];
             if can_stap_a(&nals) {
                 let payload = build_stap_a(&nals);
-                let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, true, &payload);
-                let _ = tx.send(packet);
+                primer.push(rtp_packet(
+                    ch.next_sequence(),
+                    timestamp,
+                    ssrc,
+                    true,
+                    &payload,
+                ));
             } else {
-                let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, false, sps);
-                let _ = tx.send(packet);
-                let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, true, pps);
-                let _ = tx.send(packet);
+                primer.push(rtp_packet(ch.next_sequence(), timestamp, ssrc, false, sps));
+                primer.push(rtp_packet(ch.next_sequence(), timestamp, ssrc, true, pps));
             }
-        } else if let Some(sps) = sps {
-            let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, true, &sps);
-            let _ = tx.send(packet);
-        } else if let Some(pps) = pps {
-            let packet = rtp_packet(ch.next_sequence(), timestamp, ssrc, true, &pps);
-            let _ = tx.send(packet);
+        } else if let Some(sps) = &sps {
+            primer.push(rtp_packet(ch.next_sequence(), timestamp, ssrc, true, sps));
+        } else if let Some(pps) = &pps {
+            primer.push(rtp_packet(ch.next_sequence(), timestamp, ssrc, true, pps));
+        }
+        if !primer.is_empty() {
+            let _ = tx.send(primer);
         }
         ch.subscribers.insert(id, tx);
         Some((id, rx))
@@ -171,7 +188,19 @@ impl ChannelHub {
             timestamp: 0,
             sps: None,
             pps: None,
+            awaiting_idr: true,
         }
+    }
+}
+
+fn push_access_unit(tx: &SyncSender<AccessUnitPackets>, batch: &AccessUnitPackets) -> bool {
+    match tx.try_send(batch.clone()) {
+        Ok(()) => true,
+        Err(TrySendError::Full(stale)) => {
+            drop(stale);
+            tx.try_send(batch.clone()).is_ok()
+        }
+        Err(TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -260,8 +289,15 @@ fn handle_client(mut stream: TcpStream, hub: StreamHub, _state: AppState) {
                     &[("Session", &session), ("RTP-Info", "url=trackID=0;seq=0;rtptime=0")],
                     "",
                 );
-                while let Ok(packet) = rx.recv() {
-                    if write_interleaved(&mut stream, 0, &packet).is_err() {
+                while let Ok(batch) = rx.recv() {
+                    let mut ok = true;
+                    for packet in &batch {
+                        if write_interleaved_frame(&mut stream, 0, packet).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok || stream.flush().is_err() {
                         break;
                     }
                 }
@@ -290,19 +326,15 @@ fn collect_rtp_nals<'a>(nals: &'a [&'a [u8]], ch: &mut ChannelHub) -> Vec<&'a [u
         if nal.is_empty() {
             continue;
         }
+        if matches!(nal_type(nal), Some(9)) {
+            continue;
+        }
         match nal_type(nal) {
-            Some(7) => {
-                ch.sps = Some(nal.to_vec());
-                out.push(*nal);
-            }
-            Some(8) => {
-                ch.pps = Some(nal.to_vec());
-                out.push(*nal);
-            }
-            Some(1) | Some(5) => out.push(*nal),
-            Some(6) => out.push(*nal),
+            Some(7) => ch.sps = Some(nal.to_vec()),
+            Some(8) => ch.pps = Some(nal.to_vec()),
             _ => {}
         }
+        out.push(*nal);
     }
     out
 }
@@ -318,7 +350,11 @@ fn can_stap_a(nals: &[&[u8]]) -> bool {
 }
 
 fn build_stap_a(nals: &[&[u8]]) -> Vec<u8> {
-    let nri = nals.first().map(|nal| nal[0] & 0x60).unwrap_or(0);
+    let nri = nals
+        .iter()
+        .map(|nal| nal[0] & 0x60)
+        .max()
+        .unwrap_or(0);
     let mut payload = Vec::with_capacity(stap_a_payload_size(nals));
     payload.push(nri | 24);
     for nal in nals {
@@ -474,7 +510,7 @@ fn write_response(
     stream.flush()
 }
 
-fn write_interleaved(stream: &mut TcpStream, channel: u8, payload: &[u8]) -> std::io::Result<()> {
+fn write_interleaved_frame(stream: &mut TcpStream, channel: u8, payload: &[u8]) -> std::io::Result<()> {
     let len = payload.len() as u16;
     stream.write_all(&[b'$', channel])?;
     stream.write_all(&len.to_be_bytes())?;
@@ -528,11 +564,11 @@ mod tests {
         out
     }
 
-    fn drain(rx: &Receiver<Vec<u8>>) {
+    fn drain(rx: &Receiver<AccessUnitPackets>) {
         while rx.try_recv().is_ok() {}
     }
 
-    fn recv_count(rx: &Receiver<Vec<u8>>) -> usize {
+    fn recv_batch_count(rx: &Receiver<AccessUnitPackets>) -> usize {
         let mut n = 0;
         while rx.try_recv().is_ok() {
             n += 1;
@@ -549,13 +585,15 @@ mod tests {
         let hub = StreamHub::new();
         let pps = &[0x68, 0xce, 0x3c, 0x80];
         let slice = &[0x41, 0x88, 0x84];
-        hub.publish_annexb(1, &annexb(&[pps, slice]));
+        let idr = &[0x65, 0xdd];
+        hub.publish_annexb(1, &annexb(&[pps, idr]));
         let (_, rx) = hub.subscribe(1).unwrap();
         drain(&rx);
         hub.publish_annexb(1, &annexb(&[pps, slice]));
-        let packet = rx.try_recv().expect("one stap-a frame");
-        assert_eq!(recv_count(&rx), 0);
-        assert_eq!(rtp_payload(&packet)[0] & 0x1f, 24);
+        let batch = rx.try_recv().expect("one access unit");
+        assert_eq!(recv_batch_count(&rx), 0);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(rtp_payload(&batch[0])[0] & 0x1f, 24);
     }
 
     #[test]
@@ -564,12 +602,14 @@ mod tests {
         let pps = &[0x68, 0x01];
         let aud = &[0x09, 0x10];
         let slice = &[0x41, 0x02];
-        hub.publish_annexb(1, &annexb(&[pps, aud, slice]));
+        let idr = &[0x65, 0xdd];
+        hub.publish_annexb(1, &annexb(&[pps, idr]));
         let (_, rx) = hub.subscribe(1).unwrap();
         drain(&rx);
         hub.publish_annexb(1, &annexb(&[pps, aud, slice]));
-        let packet = rx.try_recv().expect("pps+slice stap-a");
-        let payload = rtp_payload(&packet);
+        let batch = rx.try_recv().expect("pps+slice stap-a");
+        assert_eq!(batch.len(), 1);
+        let payload = rtp_payload(&batch[0]);
         assert_eq!(payload[0] & 0x1f, 24);
         let pps_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
         assert_eq!(&payload[3..3 + pps_len], pps);

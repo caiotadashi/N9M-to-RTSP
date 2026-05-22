@@ -429,7 +429,7 @@ fn parse_media_payload(payload: &[u8]) -> Option<(usize, Vec<u8>)> {
     if rec_type != b'2' && rec_type != b'3' {
         return None;
     }
-    let start = find_annexb_start(payload)?;
+    let start = annexb_start_offset(payload)?;
     let video_len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
     let end = start.saturating_add(video_len).min(payload.len());
     if end <= start {
@@ -438,6 +438,18 @@ fn parse_media_payload(payload: &[u8]) -> Option<(usize, Vec<u8>)> {
     let channel = payload[0] as usize + 1;
     Some((channel, payload[start..end].to_vec()))
 }
+
+fn annexb_start_offset(payload: &[u8]) -> Option<usize> {
+    if payload.len() > N9M_DC_ANNEXB_OFFSET + 3 {
+        let at = &payload[N9M_DC_ANNEXB_OFFSET..];
+        if at.starts_with(&[0, 0, 1]) || (at.len() >= 4 && at.starts_with(&[0, 0, 0, 1])) {
+            return Some(N9M_DC_ANNEXB_OFFSET);
+        }
+    }
+    find_annexb_start(payload)
+}
+
+const N9M_DC_ANNEXB_OFFSET: usize = 21;
 
 fn find_annexb_start(buf: &[u8]) -> Option<usize> {
     let mut i = 0;
