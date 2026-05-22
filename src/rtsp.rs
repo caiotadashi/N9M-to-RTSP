@@ -11,8 +11,6 @@ use crate::AppState;
 const RTP_MTU: usize = 1200;
 /// 90 kHz clock at ~15 fps (matches observed device rate).
 const RTP_TIMESTAMP_STEP: u32 = 6000;
-/// N9M `dc` records place Annex-B at a fixed offset in the capture (400/401 packets).
-const N9M_DC_ANNEXB_OFFSET: usize = 21;
 
 type AccessUnitPackets = Vec<Vec<u8>>;
 
